@@ -108,6 +108,11 @@ StreamReader::grow_status StreamReader_memory::wait_for_file_size(uint64_t targe
 
 bool StreamReader_memory::read(void* data, size_t size)
 {
+  // AUDIT: uint64_t addition could wrap if m_position is near UINT64_MAX and size is large.
+  // In practice m_position is always <= m_length (enforced by seek()), and m_length is bounded
+  // by the host's address space, so overflow is unreachable.  If this invariant ever breaks,
+  // end_pos would wrap to a small value, bypass the bounds check, and the memcpy below would
+  // be an OOB read from m_data.
   uint64_t end_pos = m_position + size;
   if (end_pos > m_length) {
     return false;
@@ -167,6 +172,13 @@ BitstreamRange::BitstreamRange(std::shared_ptr<StreamReader> istr,
                                size_t end) // one past end
   : m_istr(std::move(istr)), m_remaining(end - start)
 {
+  // AUDIT [underflow behind assert]: if end < start (possible when the caller's overflow in
+  // computing end is not caught before this call — see file_layout.cc TODO: overflow sites),
+  // `end - start` wraps to ~SIZE_MAX in release builds where NDEBUG disables the assert.
+  // m_remaining = ~SIZE_MAX causes every prepare_read() call to succeed (m_remaining >= nBytes
+  // is trivially true), so all subsequent reads proceed without bounds checking and will read
+  // arbitrary data from the stream.  This is the highest-severity consequence of the overflow
+  // bugs in file_layout.cc.  The assert must be replaced by a hard runtime check.
   assert(end >= start);
 
   bool success = m_istr->seek(start);
@@ -519,6 +531,12 @@ bool BitstreamRange::prepare_read(size_t nBytes)
 
 StreamReader::grow_status BitstreamRange::wait_for_available_bytes(size_t nBytes)
 {
+  // AUDIT: signed/unsigned mismatch — get_position() is uint64_t, nBytes is size_t, but the
+  // sum is stored in int64_t.  If get_position() + nBytes exceeds INT64_MAX the addition
+  // overflows (signed UB).  The negative int64_t is then implicitly widened to a large uint64_t
+  // when wait_for_file_size() takes it as uint64_t, causing a spurious size_beyond_eof result
+  // and a parse error instead of an OOB read.  Impact: incorrect error, not memory safety.
+  // Fix: use uint64_t for target_size, or add an overflow guard before the addition.
   int64_t target_size = m_istr->get_position() + nBytes;
 
   return m_istr->wait_for_file_size(target_size);

@@ -93,6 +93,16 @@ Result<std::vector<uint8_t>> DataExtent::read_data(uint64_t offset, uint64_t siz
   std::vector<uint8_t> data;
 
   if (!m_raw.empty()) {
+    // AUDIT [OOB vector read — latent bug]: when m_raw is pre-populated (caching path) and
+    // offset + size > m_raw.size(), the iterator arithmetic m_raw.begin() + offset + size
+    // advances past m_raw.end(), which is undefined behaviour (OOB read).  There is no bounds
+    // check here.  In the current code flow DataExtent is always freshly constructed before
+    // decode, so m_raw starts empty and the Source::Image branch below (which is bounds-
+    // checked via iloc) is taken instead.  However, if future code reuses a DataExtent across
+    // calls, or if an adversary triggers the iloc field-size misalignment bug (BUG-2) so that
+    // the first read_data() populates m_raw with fewer bytes than expected, a subsequent
+    // read_data(offset, size) call with offset+size > m_raw.size() would read out of bounds.
+    // Fix: add `if (offset + size > m_raw.size()) { return Error{...}; }` before this line.
     data.insert(data.begin(), m_raw.begin() + offset, m_raw.begin() + offset + size);
     return data;
   }

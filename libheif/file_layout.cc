@@ -102,7 +102,12 @@ Error FileLayout::read(const std::shared_ptr<StreamReader>& stream, const heif_s
   bool moov_found = false;
 
   for (;;) {
-    // TODO: overflow
+    // AUDIT [overflow]: next_box_start + MAXIMUM_BOX_HEADER_SIZE (32) could wrap to a small
+    // uint64_t if next_box_start is near UINT64_MAX.  m_max_length is bounded by the input
+    // buffer length (a size_t), so next_box_start cannot reach UINT64_MAX through normal
+    // box traversal — each step only advances by get_box_size() which is checked against
+    // m_max_length.  However, the combined overflow of next_box_start (line ~252) PLUS this
+    // addition is not formally proved safe; an explicit saturation check should be added.
     uint64_t next_box_header_end = next_box_start + MAXIMUM_BOX_HEADER_SIZE;
     if (next_box_header_end > m_max_length) {
       m_max_length = stream->request_range(next_box_start, next_box_header_end);
@@ -135,7 +140,13 @@ Error FileLayout::read(const std::shared_ptr<StreamReader>& stream, const heif_s
                 "Cannot read meta box with unspecified size"};
       }
 
-      // TODO: overflow
+      // AUDIT [overflow]: meta_box_start + get_box_size() — if get_box_size() is attacker-
+      // controlled and meta_box_start is large, the sum could wrap to a value less than
+      // meta_box_start.  BitstreamRange(start, end) is then called with end < start; its
+      // assert(end >= start) fires only in debug builds; in release mode m_remaining underflows
+      // to ~SIZE_MAX, bypassing all prepare_read() bounds checks and allowing unbounded reads
+      // past the valid buffer.  Mitigation: add an explicit overflow guard, e.g.:
+      //   if (box_header.get_box_size() > UINT64_MAX - meta_box_start) { return error; }
       uint64_t end_of_meta_box = meta_box_start + box_header.get_box_size();
       if (m_max_length < end_of_meta_box) {
         m_max_length = m_stream_reader->request_range(meta_box_start, end_of_meta_box);
@@ -206,7 +217,10 @@ Error FileLayout::read(const std::shared_ptr<StreamReader>& stream, const heif_s
                 "Cannot read moov box with unspecified size"};
       }
 
-      // TODO: overflow
+      // AUDIT [overflow]: same as the meta box case above — moov_box_start + get_box_size()
+      // can wrap if the size field is crafted.  Same consequence: BitstreamRange gets
+      // end < start in release mode, m_remaining underflows to ~SIZE_MAX.
+      // Needs the same saturation check before this addition.
       uint64_t end_of_moov_box = moov_box_start + box_header.get_box_size();
       if (m_max_length < end_of_moov_box) {
         m_max_length = m_stream_reader->request_range(moov_box_start, end_of_moov_box);

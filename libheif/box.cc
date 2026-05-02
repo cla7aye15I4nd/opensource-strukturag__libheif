@@ -1572,6 +1572,34 @@ Error Box_iloc::parse(BitstreamRange& range, const heif_security_limits* limits)
   int base_offset_size = (values4 >> 4) & 0xF;
   int index_size = 0;
 
+  // AUDIT [stream-misalignment → codec data injection]: the HEIF/ISOBMFF spec
+  // (ISO 14496-12 §8.11.3) mandates that offset_size, length_size, base_offset_size, and
+  // index_size each be 0, 4, or 8.  The per-extent read loops below use if/else-if chains
+  // that only handle those three values.  Any other nibble value (1–3, 5–7, 9–15) is
+  // silently skipped — the corresponding field bytes are NOT consumed from the stream.
+  //
+  // Concrete example with offset_size = 5 (invalid), length_size = 4 (valid):
+  //   - Neither branch is taken for the 5-byte offset field → extent.offset = 0
+  //   - The 5 offset bytes remain in the stream
+  //   - read32() for extent.length reads [byte0..3 of the real offset] → attacker-crafted
+  //   - Remaining 1 byte of real offset and the real length bytes are lost
+  //
+  // Downstream consequence (construction_method == 0 path in read_data):
+  //   1. extent.offset = 0 → istr->seek(0) → seeks to BYTE 0 of the input HEIF file
+  //   2. extent.length = attacker-chosen 32-bit value (the misread bytes)
+  //   3. Bounds check: each value <= MAX_FILE_POS passes; seek(0) succeeds; file[0..N] is read
+  //   4. This data (ftyp box header etc., fully attacker-controlled) is placed in dest[]
+  //   5. dest[] is passed to the image codec (HEVC / AV1 / JPEG / unci etc.) as "compressed data"
+  //   6. The codec processes arbitrary attacker-controlled bytes as a valid bitstream →
+  //      this bypasses all HEIF-level data validation and injects a codec-layer payload
+  //
+  // A second consequence chains into decoder.cc DataExtent::read_data(offset, size): if
+  // m_raw is first populated (e.g. via the no-arg read_data() cache path) with fewer bytes
+  // than expected due to the corrupted extent.length, a subsequent read_data(offset, size)
+  // call with offset+size > m_raw.size() results in an OOB vector iterator advance (see
+  // AUDIT comment in decoder.cc:read_data).
+  //
+  // Fix: validate each field size against {0,4,8} and return an error for any other value.
   if (version == 1 || version == 2) {
     index_size = (values4 & 0xF);
   }
@@ -1622,6 +1650,9 @@ Error Box_iloc::parse(BitstreamRange& range, const heif_security_limits* limits)
     item.data_reference_index = range.read16();
 
     item.base_offset = 0;
+    // AUDIT: base_offset_size not validated against {0,4,8}.  If it is e.g. 2, neither branch
+    // is taken, item.base_offset stays 0, and the 2-byte field is NOT consumed from the stream.
+    // The next read16() for extent_count then reads those 2 bytes instead of the real count.
     if (base_offset_size == 4) {
       item.base_offset = range.read32();
     }
@@ -1666,6 +1697,8 @@ Error Box_iloc::parse(BitstreamRange& range, const heif_security_limits* limits)
         }
       }
 
+      // AUDIT: if offset_size is not in {0,4,8} no bytes are consumed here (see note above on
+      // field-size validation).  extent.offset remains 0 while the stream position is wrong.
       extent.offset = 0;
       if (offset_size == 4) {
         extent.offset = range.read32();
@@ -1675,7 +1708,7 @@ Error Box_iloc::parse(BitstreamRange& range, const heif_security_limits* limits)
         extent.offset |= range.read32();
       }
 
-
+      // AUDIT: same stream-misalignment risk for length_size not in {0,4,8}.
       extent.length = 0;
       if (length_size == 4) {
         extent.length = range.read32();
@@ -1821,6 +1854,9 @@ Error Box_iloc::read_data(heif_item_id item_id,
                 "iloc data pointers out of allowed range"};
       }
 
+      // AUDIT [overflow analysis]: extent.offset, item->base_offset, and extent.length are
+      // each individually checked against MAX_FILE_POS (2^55-1) above.  Their sum is at most
+      // 3*(2^55-1) ≈ 1.08e17 which is well below UINT64_MAX (1.84e19).  No overflow here.
       StreamReader::grow_status status = istr->wait_for_file_size(extent.offset + item->base_offset + extent.length);
       if (status == StreamReader::grow_status::size_beyond_eof) {
         // Out-of-bounds
@@ -1912,11 +1948,24 @@ Error Box_iloc::read_data(heif_item_id item_id,
                 "idat box referenced in iref box is not present in file"};
       }
 
+      // AUDIT [ignored error return]: the return value of idat->read_data() is silently
+      // discarded.  If it fails (e.g., out-of-bounds offset, security-limit exceeded, or
+      // idat seek/read error) the error is never surfaced: execution continues as if the
+      // read succeeded, and the caller receives a potentially incomplete or zeroed-out
+      // buffer with an Error::Ok return.  This is a confirmed bug; the return value must
+      // be captured and propagated.
       idat->read_data(istr,
                       extent.offset + item->base_offset,
                       extent.length,
                       *dest, limits);
 
+      // AUDIT [integer underflow]: size is uint64_t. If extent.length > size (more data in
+      // the extent than was requested), this subtraction wraps to ~0ULL.  The idat branch
+      // also ignores the 'size' parameter entirely (always reads extent.length bytes).  On
+      // the next iteration read_len would be min(next_extent.length, ~0ULL) = next_extent.length,
+      // potentially reading far more than the caller requested.  The idat read is individually
+      // bounded, but the logic is inconsistent.  Should be clamped analogously to the
+      // construction_method==0 branch above (lines 1858-1869).
       size -= extent.length;
     }
     else {
@@ -4058,6 +4107,14 @@ Error Box_idat::read_data(const std::shared_ptr<StreamReader>& istr,
 
 
   // move to start of data
+  // AUDIT [overflow in bounds check]: (uint64_t) m_data_start_pos + get_box_size() — if
+  // m_data_start_pos is stored as std::streampos (effectively int64_t), the cast to uint64_t
+  // is well-defined only for non-negative values.  Since m_data_start_pos is read from the
+  // stream position during parse, it is always >= 0 in practice.  However, the addition with
+  // get_box_size() (uint64_t) could overflow if the box extends to the very end of a 2^64-byte
+  // range — unlikely but the check is not formally overflow-safe.
+  // AUDIT: start + length > get_box_size() — start and length are each bounded by MAX_FILE_POS
+  // (2^55-1), so their sum is at most 2*(2^55-1) which cannot overflow uint64_t.  Safe.
   if (start > (uint64_t) m_data_start_pos + get_box_size()) {
     return Error(heif_error_Invalid_input,
                  heif_suberror_End_of_data);
@@ -4067,6 +4124,11 @@ Error Box_idat::read_data(const std::shared_ptr<StreamReader>& istr,
                  heif_suberror_End_of_data);
   }
 
+  // AUDIT [signed/unsigned mix]: (int64_t) m_data_start_pos + start + length mixes int64_t
+  // with two uint64_t values.  The result is computed in int64_t; if it exceeds INT64_MAX,
+  // signed overflow UB occurs.  The resulting negative value is then widened to uint64_t for
+  // wait_for_file_size(), which returns size_beyond_eof, yielding an error rather than an OOB
+  // read.  Low severity, but should be rewritten as a pure uint64_t expression.
   StreamReader::grow_status status = istr->wait_for_file_size((int64_t) m_data_start_pos + start + length);
   if (status == StreamReader::grow_status::size_beyond_eof ||
       status == StreamReader::grow_status::timeout) {
@@ -4075,6 +4137,10 @@ Error Box_idat::read_data(const std::shared_ptr<StreamReader>& istr,
                  heif_suberror_End_of_data);
   }
 
+  // AUDIT: istr->seek() failure is only caught by an assert (disabled in release builds).
+  // If the bounds checks above are bypassed (e.g., via the overflow described above), seek()
+  // would return false here and the subsequent read() would silently read from the wrong or
+  // last position.  Should be a hard error check instead of an assert.
   bool success;
   success = istr->seek(m_data_start_pos + (std::streampos) start);
   assert(success);
