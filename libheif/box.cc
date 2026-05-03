@@ -1576,6 +1576,20 @@ Error Box_iloc::parse(BitstreamRange& range, const heif_security_limits* limits)
     index_size = (values4 & 0xF);
   }
 
+  // ISO/IEC 14496-12 §8.11.3 requires offset_size, length_size, base_offset_size and
+  // (v1/v2) index_size each to be 0, 4 or 8. Any other nibble would silently misalign
+  // the per-extent reads below — the field bytes stay in the stream and the next read
+  // consumes them as another field, yielding attacker-controlled offsets and lengths.
+  auto valid_field_size = [](int s) { return s == 0 || s == 4 || s == 8; };
+  if (!valid_field_size(offset_size) ||
+      !valid_field_size(length_size) ||
+      !valid_field_size(base_offset_size) ||
+      !valid_field_size(index_size)) {
+    return {heif_error_Invalid_input,
+            heif_suberror_Invalid_box_size,
+            "iloc field size must be 0, 4 or 8"};
+  }
+
   uint32_t item_count = 0;
   if (version < 2) {
     item_count = range.read16();
