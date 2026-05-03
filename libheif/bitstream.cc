@@ -23,6 +23,7 @@
 #include <utility>
 #include <cstring>
 #include <cassert>
+#include <limits>
 
 #include "common_utils.h"
 
@@ -519,7 +520,11 @@ bool BitstreamRange::prepare_read(size_t nBytes)
 
 StreamReader::grow_status BitstreamRange::wait_for_available_bytes(size_t nBytes)
 {
-  int64_t target_size = m_istr->get_position() + nBytes;
+  uint64_t pos = m_istr->get_position();
+  if (nBytes > std::numeric_limits<uint64_t>::max() - pos) {
+    return StreamReader::grow_status::size_beyond_eof;
+  }
+  uint64_t target_size = pos + nBytes;
 
   return m_istr->wait_for_file_size(target_size);
 }
