@@ -38,6 +38,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <cassert>
 #include <array>
@@ -4067,7 +4068,20 @@ Error Box_idat::read_data(const std::shared_ptr<StreamReader>& istr,
                  heif_suberror_End_of_data);
   }
 
-  StreamReader::grow_status status = istr->wait_for_file_size((int64_t) m_data_start_pos + start + length);
+  // m_data_start_pos comes from the parser and is always >= 0; cast to uint64_t and
+  // do all arithmetic unsigned to avoid signed/unsigned narrowing UB. Guard the two
+  // additions against wrap.
+  if (m_data_start_pos < 0) {
+    return Error(heif_error_Invalid_input,
+                 heif_suberror_End_of_data);
+  }
+  uint64_t target_data_start = static_cast<uint64_t>(m_data_start_pos);
+  if (start > std::numeric_limits<uint64_t>::max() - length ||
+      start + length > std::numeric_limits<uint64_t>::max() - target_data_start) {
+    return Error(heif_error_Invalid_input,
+                 heif_suberror_End_of_data);
+  }
+  StreamReader::grow_status status = istr->wait_for_file_size(target_data_start + start + length);
   if (status == StreamReader::grow_status::size_beyond_eof ||
       status == StreamReader::grow_status::timeout) {
     // TODO: maybe we should introduce some 'Recoverable error' instead of 'Invalid input'
