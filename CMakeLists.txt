@@ -660,6 +660,11 @@ endif()
 
 add_subdirectory (gnome)
 
+option(ENABLE_AUDIT_REPROS "Build the audit_repros/ ASAN reproducer harnesses." OFF)
+if (ENABLE_AUDIT_REPROS)
+    add_subdirectory(audit_repros)
+endif()
+
 
 # --- packaging (source code)
 

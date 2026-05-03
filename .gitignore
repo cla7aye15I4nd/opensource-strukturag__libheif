@@ -4,8 +4,14 @@
 build
 _build
 buildjs
+build-audit-asan/
 CMakeUserPresets.json
 third-party/SVT-AV1/
 third-party/dav1d/
 third-party/libwebp/
 third-party/rav1e/
+
+# audit_repros: ignore generated PoC inputs, run logs, and Python caches
+audit_repros/out/
+__pycache__/
+*.pyc
