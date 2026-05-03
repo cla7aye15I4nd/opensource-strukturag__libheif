@@ -38,6 +38,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <cassert>
 #include <array>
@@ -4058,11 +4059,26 @@ Error Box_idat::read_data(const std::shared_ptr<StreamReader>& istr,
 
 
   // move to start of data
-  if (start > (uint64_t) m_data_start_pos + get_box_size()) {
+  // m_data_start_pos comes from a parsed stream position (always non-negative in
+  // practice), but reject a negative value rather than rely on the cast being
+  // defined, and guard `data_start + box_size` against overflow.
+  if (m_data_start_pos < 0) {
     return Error(heif_error_Invalid_input,
                  heif_suberror_End_of_data);
   }
-  else if (length > get_box_size() || start + length > get_box_size()) {
+  uint64_t data_start = static_cast<uint64_t>(m_data_start_pos);
+  uint64_t box_size = get_box_size();
+  if (box_size > std::numeric_limits<uint64_t>::max() - data_start) {
+    return Error(heif_error_Invalid_input,
+                 heif_suberror_End_of_data);
+  }
+  if (start > data_start + box_size) {
+    return Error(heif_error_Invalid_input,
+                 heif_suberror_End_of_data);
+  }
+  // start and length are each bounded by MAX_FILE_POS (2^55-1), so start + length
+  // is at most 2*(2^55-1) which cannot overflow uint64_t.
+  if (length > box_size || start + length > box_size) {
     return Error(heif_error_Invalid_input,
                  heif_suberror_End_of_data);
   }
