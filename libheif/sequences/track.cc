@@ -162,6 +162,20 @@ heif_sample_aux_info_type SampleAuxInfoReader::get_type() const
 
 Result<std::vector<uint8_t> > SampleAuxInfoReader::get_sample_info(const HeifFile* file, uint32_t sample_idx)
 {
+  // AUDIT [HIGH — uint32 multiplication overflow → wrong file offset]:
+  //   In the contiguous branch, `sample_idx * size` is performed in uint32_t arithmetic
+  //   (uint8_t `size` promotes to int → uint32_t).  sample_idx is bounded only by
+  //   max_sequence_frames (default 18M) and `size` can be up to 255 — product reaches
+  //   ~4.6e9, exceeding 2^32.  After the wrap, the uint64_t `offset = m_singleChunk_offset
+  //   + small_value` points to a low file region; HeifFile::append_data_from_file_range
+  //   below silently reads `size` attacker-influenced bytes from there and returns them
+  //   as TAI timestamp / content-id / metadata.
+  //   Mitigation: cast `size` to uint64_t before the multiply, OR perform the addition
+  //   in uint64_t with an explicit overflow check.
+  // AUDIT [uninitialised read]: in the `else` branch, `offset` is only assigned inside
+  //   `if (size > 0 && sample_idx < m_sample_offsets.size())`.  When size==0 we fall
+  //   through with `offset` uninitialised; the outer `if (size > 0)` guard at line 185
+  //   currently saves us but the dataflow is fragile.  Initialise `offset = 0;`.
   uint64_t offset;
   uint8_t size;
 
@@ -323,6 +337,15 @@ Error Track::load(const std::shared_ptr<Box_trak>& trak_box)
 
   // --- check that number of samples in various boxes are consistent
 
+  // AUDIT [HIGH — overflow defeats this consistency check]:
+  //   Box_stts::get_number_of_samples() / Box_ctts::get_number_of_samples() return uint32_t
+  //   sums of uint32_t per-entry sample_count fields (seq_boxes.cc:665-673, 773-781).
+  //   The accumulator can wrap modulo 2^32; an attacker can craft entries whose
+  //   accumulated count overflows to land EXACTLY on stsz->num_samples(), passing this
+  //   check while producing a logically inconsistent timeline.  Combined with the
+  //   stsc-overflow path below (line 380), this enables OOB reads of the stsz table
+  //   in the Chunk constructor (chunk.cc:94).  Mitigation: accumulate into uint64_t
+  //   in the Box_stts/Box_ctts accessors and treat overflow as inconsistency.
   if (m_stts->get_number_of_samples() != m_stsz->num_samples()) {
     return {
       heif_error_Invalid_input,
@@ -377,6 +400,17 @@ Error Track::load(const std::shared_ptr<Box_trak>& trak_box)
       }
     }
 
+    // AUDIT [HIGH — uint32 overflow in bounds check]:
+    //   `current_sample_idx + sampleToChunk.samples_per_chunk` is uint32_t addition.
+    //   stsc parse bounds each individual samples_per_chunk against max_sequence_frames,
+    //   but does not bound the cumulative sum.  An attacker can craft multiple stsc
+    //   entries whose accumulated count overflows uint32_t — the comparison then wraps
+    //   to a small value that is < stsz->num_samples(), and the Chunk constructor below
+    //   is called with first_sample/num_samples values that index past the end of stsz
+    //   (chunk.cc:94 OOB-reads the std::vector backing store).  The returned uint32_t
+    //   sample_size becomes the request size passed unchecked to
+    //   HeifFile::append_data_from_file_range (file.cc:836 — see AUDIT there for the
+    //   silent-failure sink).  Mitigation: cast to uint64_t before the add.
     if (current_sample_idx + sampleToChunk.samples_per_chunk > m_stsz->num_samples()) {
       return {
         heif_error_Invalid_input,
@@ -1032,6 +1066,17 @@ Error Track::init_sample_timing_table()
       current_chunk++;
       current_sample_in_chunk_idx=0;
 
+      // AUDIT [HIGH — off-by-one OOB]: the inner guard uses '>' but current_chunk can
+      //   validly reach m_chunks.size() here (one past the last chunk).  When that
+      //   happens the guard never fires; `timing.chunkIdx = current_chunk` below stores
+      //   m_chunks.size() and every subsequent access via m_chunks[chunkIdx] in
+      //   Track_Visual::decode_next_image_sample / Track::get_next_sample_raw_data
+      //   is an OOB std::vector read of a shared_ptr<Chunk>.  Reachable when stsz/stts
+      //   are made inconsistent via the overflow paths above, or via the off-by-one
+      //   itself when the last chunk is exactly filled.  Use '>=' instead.
+      // AUDIT [dead store]: `timing.chunkIdx = 0` is overwritten unconditionally by
+      //   the assignment after the while loop, so the "// TODO: error" branch has no
+      //   visible effect even when the guard fires.
       if (current_chunk > m_chunks.size()) {
         timing.chunkIdx = 0; // TODO: error
       }
@@ -1065,6 +1110,15 @@ Error Track::init_sample_timing_table()
       };
     }
 
+    // AUDIT [uint64 multiplication overflow]: `(seq_duration / unit_duration) *
+    //   media_timeline.size()` is uint64 arithmetic.  All three operands are attacker-
+    //   controlled (mvhd duration, mdhd duration, populated stsz).  Although the leading
+    //   division usually shrinks the value, with mvhd_duration near UINT64_MAX and
+    //   mdhd_duration small the quotient can still be huge; multiplied by media_timeline
+    //   size, the product wraps.  m_num_output_samples is then either tiny (immediate
+    //   end-of-sequence on the first decode call) or huge (DoS via long decode loop) —
+    //   and combined with the off-by-one OOB above, controls how many times the OOB
+    //   access happens.  Use a checked multiply.
     m_num_output_samples = m_heif_context->get_sequence_duration() / get_duration_in_media_units() * media_timeline.size();
   }
   else {

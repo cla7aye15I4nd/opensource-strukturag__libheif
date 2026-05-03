@@ -145,6 +145,14 @@ heif_error heif_image_handle_get_metadata(const heif_image_handle* handle,
           return heif_error_null_pointer_argument;
         }
 
+        // AUDIT [API design — no out-buffer length parameter, OOB-write on caller side]:
+        //   This function takes no `size_t out_data_size` argument: it copies metadata->m_data.size()
+        //   bytes into out_data, trusting the caller to have queried heif_image_handle_get_metadata_size
+        //   first AND to have allocated at least that many bytes.  Since metadata->m_data.size() is
+        //   ultimately attacker-controlled (read from an iloc-referenced item), any caller that
+        //   allocates a fixed-size buffer (e.g. uint8_t buf[1024]) without honoring the size query
+        //   gets a heap/stack OOB-write.  This is documented behaviour, but it is a foot-gun that
+        //   has caused security bugs in downstream consumers.  No safer alternative API exists.
         memcpy(out_data,
                metadata->m_data.data(),
                metadata->m_data.size());

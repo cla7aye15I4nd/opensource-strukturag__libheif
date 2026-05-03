@@ -148,8 +148,23 @@ heif_error heif_item_get_item_data(const heif_context* ctx,
     return {heif_error_Usage_error, heif_suberror_Null_pointer_argument, "cannot return data with out_data_size==NULL"};
   }
 
+  // AUDIT [unbounded allocation, attacker-controlled size]:
+  //   get_item_data() returns a vector whose size is the iloc-described item length, capped
+  //   by security_limits->max_memory_block_size in the parsing path.  However, the alloc
+  //   here `new uint8_t[dataResult->size()]` does not consult the security limits a second
+  //   time and is the libheif-public allocation site (caller will heif_release_item_data).
+  //   If the limit is generous (default ~512 MiB) a single malicious item can request
+  //   that much memory per call.
+  // AUDIT [missing crash guard on `new` failure]:
+  //   `new uint8_t[...]` (no std::nothrow) throws std::bad_alloc on OOM; this function is
+  //   declared as a C API (`extern "C"`).  An exception escaping into a C caller is UB.
+  //   Fix: use `new (std::nothrow) uint8_t[...]` and return a memory-allocation error.
   auto dataResult = ctx->context->get_heif_file()->get_item_data(item_id, out_compression_format);
   if (!dataResult) {
+    // AUDIT [potential NULL-deref]: *out_data_size is unconditionally written here even when
+    // the caller passed out_data_size==NULL.  The early return above only catches the case
+    // where out_data is non-NULL AND out_data_size is NULL.  If the caller passes both NULL
+    // (i.e. only requesting the compression format), this line dereferences NULL.
     *out_data_size = 0;
     if (out_data) {
       *out_data = 0;
@@ -290,6 +305,11 @@ heif_error heif_context_add_item_references(heif_context* ctx,
                                             const heif_item_id* to_item,
                                             int num_to_items)
 {
+  // AUDIT [signed pointer arithmetic, OOB-read]:
+  //   num_to_items is signed `int`, unchecked.  Negative values produce pointer underflow
+  //   in `to_item + num_to_items` (UB); huge positive values walk past the caller-provided
+  //   buffer.  std::vector ctor then copies `num_to_items` heif_item_id values from beyond
+  //   the buffer.  Mitigation: reject num_to_items < 0; cap upper bound.
   std::vector<heif_item_id> to_refs(to_item, to_item + num_to_items);
 
   ctx->context->get_heif_file()->add_iref_reference(from_item,
@@ -314,6 +334,13 @@ heif_error heif_context_add_item(heif_context* ctx,
     };
   }
 
+  // AUDIT [HIGH — signed→unsigned int reinterpretation → OOB-read of caller buffer]:
+  //   `size` is signed `int`.  HeifFile::add_infe takes it as `size_t`, so a negative
+  //   value sign-extends to ~SIZE_MAX.  Inside HeifFile::set_item_data, this becomes
+  //   `data_array.resize(size)` (bad_alloc) followed by `memcpy(..., data, size)` — an
+  //   OOB read of ~SIZE_MAX bytes from the caller's `data` pointer.
+  //   Same pattern in heif_context_add_mime_item, heif_context_add_precompressed_mime_item,
+  //   heif_context_add_uri_item below.  Reject size < 0 here.
   Result<heif_item_id> result = ctx->context->get_heif_file()->add_infe(fourcc(item_type), (const uint8_t*) data, size);
 
   if (result && out_item_id) {

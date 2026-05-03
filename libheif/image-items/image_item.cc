@@ -610,6 +610,18 @@ Error ImageItem::transform_requested_tile_position_to_original_tile_position(uin
 
   heif_image_tiling tiling = get_heif_image_tiling();
 
+  // AUDIT [HIGH — underflow → OOB grid index, reachable from heif_image_handle_decode_image_tile]:
+  //   tile_x and tile_y reach this function from the public API caller (uint32_t inputs).
+  //   The subtractions below — `tiling.num_columns - 1 - tile_y` (line 618), `tiling.num_rows
+  //   - 1 - tile_x` (626), `tiling.num_columns - 1 - tile_x` (632), `tiling.num_rows - 1 - tile_y`
+  //   (633), `tiling.num_columns - 1 - tile_x` (647), `tiling.num_rows - 1 - tile_y` (650) —
+  //   are all uint32_t.  When the caller passes tile_x >= num_columns or tile_y >= num_rows
+  //   (or num_columns / num_rows is 0), the result wraps to ~UINT32_MAX.  The wrapped value
+  //   is then passed back to grid.cc::ImageGrid get_tile_id (line ~584), where it is used
+  //   as `ty * columns + tx` and finally as an index into m_grid_tile_ids — OOB read of
+  //   the heif_item_id vector.  No tile_x/tile_y range check exists at function entry.
+  //   Mitigation: validate `tile_x < tiling.num_columns && tile_y < tiling.num_rows`
+  //   before the loop, and check tiling.num_columns/num_rows are nonzero.
   //for (auto& prop : std::ranges::reverse_view(propertiesResult.value)) {
   for (auto propIter = propertiesResult->rbegin(); propIter != propertiesResult->rend(); propIter++) {
     if (auto irot = std::dynamic_pointer_cast<Box_irot>(*propIter)) {

@@ -581,6 +581,18 @@ Error ImageItem_Grid::decode_and_paste_tile_image(heif_item_id tileID, uint32_t 
 Result<std::shared_ptr<HeifPixelImage>> ImageItem_Grid::decode_grid_tile(const heif_decoding_options& options, uint32_t tx, uint32_t ty,
                                                                          std::set<heif_item_id> processed_ids) const
 {
+  // AUDIT [HIGH — uint32 multiplication overflow + assert-only bound, OOB-read]:
+  //   `ty * m_grid_spec.get_columns() + tx` is uint32_t arithmetic.  Reachable from
+  //   heif_image_handle_decode_image_tile (public API) which forwards caller-supplied
+  //   tile_x/tile_y to transform_requested_tile_position_to_original_tile_position
+  //   (image_item.cc) and then here.  No bounds check on tx/ty exists at the API entry
+  //   (see AUDIT in image_item.cc:transform_requested_tile_position_to_original_tile_position).
+  //   - The multiplication wraps when ty*columns >= 2^32.
+  //   - `assert(idx < m_grid_tile_ids.size())` is compiled out in release builds.
+  //   The vector subscript m_grid_tile_ids[idx] is then OOB; the resulting "tile_id" is
+  //   read from arbitrary heap memory and used as a heif_item_id by get_image() — i.e.
+  //   the attacker can steer the decoder to an arbitrary item.
+  //   Fix: explicit bounds check + uint64 multiply, returning an error.
   uint32_t idx = ty * m_grid_spec.get_columns() + tx;
 
   assert(idx < m_grid_tile_ids.size());
@@ -597,6 +609,10 @@ Result<std::shared_ptr<HeifPixelImage>> ImageItem_Grid::decode_grid_tile(const h
 
 void ImageItem_Grid::set_grid_tile_id(uint32_t tile_x, uint32_t tile_y, heif_item_id id)
 {
+  // AUDIT [OOB-write — no bounds check]: tile_y * columns + tile_x can overflow uint32 and
+  // the result is used as a vector subscript (write).  Reachable from
+  // heif_context_add_grid_image / heif_context_add_image_tile (encoder API): a caller-
+  // supplied tile_x/tile_y combined with the grid's column count produces the index.
   uint32_t idx = tile_y * m_grid_spec.get_columns() + tile_x;
   m_grid_tile_ids[idx] = id;
 }
@@ -636,6 +652,12 @@ heif_image_tiling ImageItem_Grid::get_heif_image_tiling() const
 
 void ImageItem_Grid::get_tile_size(uint32_t& w, uint32_t& h) const
 {
+  // AUDIT [missing empty-vector check + missing return after error]:
+  //   - `get_grid_tiles()[0]` is dereferenced unconditionally; if the grid has zero tiles
+  //     (parser allows rows=0/columns=0 in some malformed-but-accepted cases) this OOB-reads
+  //     element 0 of an empty vector.
+  //   - When `tile->get_item_error()` is true, the function sets w=h=0 then FALLS THROUGH
+  //     and calls tile->get_width()/get_height() on a tile in error state — should `return;`.
   heif_item_id first_tile_id = get_grid_tiles()[0];
   auto tile = get_context()->get_image(first_tile_id, true);
   if (tile->get_item_error()) {

@@ -43,6 +43,13 @@ int heif_image_handle_get_list_of_region_item_ids(const heif_image_handle* handl
                                                   int max_count)
 {
   auto region_item_ids = handle->image->get_region_item_ids();
+  // AUDIT [HIGH — signed/unsigned → wild OOB-write]:
+  //   max_count is signed `int`.  std::min((int) size, max_count) returns a negative
+  //   value when max_count < 0.  `num * sizeof(heif_item_id)` then promotes num to
+  //   size_t in the implicit conversion, yielding ~SIZE_MAX, and memcpy writes ~SIZE_MAX
+  //   bytes of attacker-controlled `region_item_ids` data into the caller's `item_ids`
+  //   buffer.  Same bug pattern in heif_text.cc:69-71.
+  //   Mitigation: `if (max_count < 0) return 0;` before std::min.
   int num = std::min((int) region_item_ids.size(), max_count);
 
   memcpy(item_ids, region_item_ids.data(), num * sizeof(heif_item_id));
@@ -292,6 +299,17 @@ static heif_error heif_region_get_poly_points(const heif_region* region, int32_t
 
   const std::shared_ptr<RegionGeometry_Polygon> poly = std::dynamic_pointer_cast<RegionGeometry_Polygon>(region->region);
   if (poly) {
+    // AUDIT [API design — no out-buffer length, OOB-write enabler in caller]:
+    //   `pts` has no length parameter.  The contract requires the caller to size it as
+    //   2 * heif_region_get_polygon_num_points() * sizeof(int32_t).  Any mismatch
+    //   (and remember poly->points.size() comes from the parsed rgan box, attacker-
+    //   controlled up to the polygon-size memory limit) yields a heap OOB write of
+    //   2 * size * sizeof(int32_t) bytes into the caller's buffer.
+    // AUDIT [signed overflow]: `2 * i` and `2 * i + 1` are signed int multiplications.
+    //   For poly->points.size() > INT32_MAX/2 (≈ 1.07 × 10^9 points), the indexing
+    //   overflows signed int (UB).  Today bounded by max_memory_block_size ≈ 4 GB / 8 B
+    //   ≈ 5 × 10^8 — close to but below the limit; raising the limit makes this
+    //   reachable.
     for (int i = 0; i < (int) poly->points.size(); i++) {
       pts[2 * i + 0] = poly->points[i].x;
       pts[2 * i + 1] = poly->points[i].y;
@@ -685,6 +703,16 @@ heif_error heif_region_get_inline_mask_data(const heif_region* region,
     *y = mask->y;
     *width = mask->width;
     *height = mask->height;
+    // AUDIT [API design — no out-buffer length, OOB-write on caller buffer]:
+    //   `data` has no length parameter; the caller must pre-size it via
+    //   heif_region_get_inline_mask_data_len().  mask->mask_data.size() is
+    //   `(uint64_t(width) * height + 7) / 8` from RegionGeometry_InlineMask::parse —
+    //   attacker-controlled (via the rgan box's width/height fields), capped only by
+    //   limits->max_image_size_pixels.  Caller mismatch → heap OOB write up to that
+    //   maximum (default 32K × 32K / 8 = 128 MB).  Add a `data_len` parameter and
+    //   clip the memcpy.
+    // AUDIT [missing NULL check]: `data` is dereferenced without a NULL check.
+    //   Caller passing data = NULL crashes here.
     memcpy(data, mask->mask_data.data(), mask->mask_data.size());
     return heif_error_success;
   }

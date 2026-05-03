@@ -315,6 +315,18 @@ Error RegionGeometry_Polygon::parse(const std::vector<uint8_t>& data,
                                     unsigned int* dataOffset,
                                     const heif_security_limits* limits)
 {
+  // AUDIT [underflow in bounds check, OOB-read]:
+  //   `data.size() - *dataOffset` is unsigned subtraction.  RegionItem::parse loops
+  //   over multiple regions, each calling its own parse() which advances *dataOffset
+  //   internally.  The outer loop only checks `data.size() <= dataOffset` BEFORE
+  //   reading the geometry-type byte (region.cc:64); after a failed-but-recoverable
+  //   inner parse, *dataOffset can have been pushed past data.size(), and this
+  //   subtraction wraps to ~SIZE_MAX, silently passing the bound check.  Subsequent
+  //   parse_unsigned/parse_signed calls then perform OOB reads of `data[*dataOffset]`.
+  //   Same pattern in RegionGeometry_Point/Rectangle/Ellipse/ReferencedMask/InlineMask
+  //   ::parse and in RegionGeometry::parse_unsigned/parse_signed (no internal bounds
+  //   check).  Mitigation: `if (*dataOffset > data.size() || data.size() - *dataOffset
+  //   < bytesRequired1) { ... }`.
   uint32_t bytesRequired1 = (field_size / 8) * 1;
   if (data.size() - *dataOffset < bytesRequired1) {
     return Error(heif_error_Invalid_input, heif_suberror_Invalid_region_data,

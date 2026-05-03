@@ -835,6 +835,24 @@ Result<std::vector<uint8_t>> HeifFile::get_uncompressed_item_data(heif_item_id I
 
 Error HeifFile::append_data_from_file_range(std::vector<uint8_t>& out_data, uint64_t offset, uint32_t size) const
 {
+  // AUDIT [HIGH — silent seek/read failure → undefined codec input]:
+  //   Both `seek()` and `read()` failures are caught only by the `// TODO: error` placeholder;
+  //   the function returns Error::Ok() unconditionally.  Consequence:
+  //     - On seek failure, the subsequent read() reads from whatever position the stream is
+  //       currently at — placing data from a wrong file region into out_data.
+  //     - On read failure, out_data has been resized by `size` bytes (line 844) and contains
+  //       value-initialised zeros (std::vector::resize default-fills) for the unread region;
+  //       the caller is given a buffer that LOOKS valid but has bytes from another source
+  //       (or zero padding) where the codec expected real bitstream content.
+  //   Reachable from heif_decode_image via DataExtent::read_data → this function.
+  //   The codec then operates on undefined / cross-region bytes — bypasses all upstream
+  //   input validation and feeds attacker-influenced data straight into HEVC/AV1/JPEG/uncC
+  //   decoders.  This is the highest-severity issue in the file.cc reading layer.
+  //   Fix: return an Error on either failure; do not resize on failure.
+  // AUDIT [integer-overflow]: `old_size + size` is size_t addition (size is uint32_t).  If
+  // out_data has already been populated (caller appends across multiple extents) and old_size
+  // + size > size_t::max, resize() throws length_error.  Bounded in practice by max_memory_block_size
+  // when limits are enforced upstream, but no formal guard here.
   bool success = m_input_stream->seek(offset);
   if (!success) {
     // TODO: error

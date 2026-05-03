@@ -244,6 +244,21 @@ void heif_item_get_property_transform_crop_borders(const heif_context* context,
     return;
   }
 
+  // AUDIT [HIGH — signed overflow + missing bounds, OOB-write enabler in caller]:
+  //   image_width/image_height are signed `int` from the public API caller.  The clap
+  //   box's right_rounded()/bottom_rounded() return int32_t derived from attacker-
+  //   controlled fractional fields (Box_clap::*_rounded use Fraction::round, box.cc:156).
+  //   Two issues:
+  //   1. `image_width - 1 - right_rounded(image_width)` is signed arithmetic — can
+  //      overflow signed int if right_rounded returns a large negative value (UB).
+  //   2. Returned left/right/top/bottom are NOT clamped to [0, image_width-1] /
+  //      [0, image_height-1].  Caller code typically uses them as crop offsets in
+  //      pixel-buffer arithmetic; an out-of-range or negative value flows directly
+  //      into OOB read/write in the caller's image processing.
+  //   In addition, when image_width or image_height is 0, Box_clap internal arithmetic
+  //   underflows (`image_width - 1U` in box.cc:3678 wraps to UINT32_MAX → silent in
+  //   release builds, asserts compiled out).  Mitigation: validate image_width > 0,
+  //   image_height > 0, clamp outputs, and sanity-check left+right < image_width.
   if (left) *left = (*clap)->left_rounded(image_width);
   if (right) *right = image_width - 1 - (*clap)->right_rounded(image_width);
   if (top) *top = (*clap)->top_rounded(image_height);

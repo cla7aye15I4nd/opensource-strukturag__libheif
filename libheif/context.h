@@ -262,6 +262,20 @@ public:
       return err;
     }
 
+    // AUDIT [HIGH — confirmed bug: missing `return` keyword → OOB vector read]:
+    //   The line below CONSTRUCTS an Error object and immediately discards it (no
+    //   variable assignment, no return).  Execution falls through to
+    //   `properties[propertyId - 1]` which is then OOB on the std::vector backing store
+    //   whenever propertyId - 1 >= properties.size().  Reachable from EVERY public
+    //   property getter API that accepts a heif_property_id:
+    //     heif_item_get_property_user_description, heif_item_get_property_transform_*,
+    //     heif_item_get_property_tai_clock_info, heif_item_get_property_tai_timestamp,
+    //     heif_item_get_property_raw_data, heif_item_get_property_raw_size,
+    //     heif_item_get_property_uuid_type, heif_item_get_property_extended_language.
+    //   propertyId is uint32_t from the public API, so the underflow `propertyId - 1`
+    //   when propertyId == 0 wraps to UINT32_MAX, then `>= properties.size()` is true,
+    //   and the discarded-Error path runs — i.e. the bug is exploitable just by passing
+    //   propertyId = 0.  Fix: prefix the Error(...) line with `return`.
     if (propertyId - 1 >= properties.size()) {
       Error(heif_error_Usage_error, heif_suberror_Invalid_property, "property index out of range");
     }

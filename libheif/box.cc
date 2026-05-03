@@ -3103,6 +3103,14 @@ Error Box_ipco::get_properties_for_item_ID(uint32_t itemID,
 
   const auto& allProperties = get_all_child_boxes();
   for (const Box_ipma::PropertyAssociation& assoc : *property_assoc) {
+    // AUDIT [off-by-one — semantically wrong, not OOB]:
+    //   The bound uses `>` but valid ipma indices are 1..N (1-based).  When
+    //   property_index == N (== allProperties.size()), the check passes and the
+    //   subscript `allProperties[N - 1]` returns the LAST property, even if the index
+    //   was attacker-crafted to mean "associate property #(N+1)" (which doesn't exist).
+    //   Result: property association silently rebinds to the last property.  Use `>=`
+    //   to make the check semantically correct.  Same in get_property_for_item_ID
+    //   below at line 3136.
     if (assoc.property_index > allProperties.size()) {
       std::stringstream sstr;
       sstr << "Nonexisting property (index=" << assoc.property_index << ") for item "
@@ -4197,6 +4205,15 @@ Error Box_EntityToGroup::parse(BitstreamRange& range, const heif_security_limits
             sstr.str()};
   }
 
+  // AUDIT [unbounded-alloc when limit is disabled]:
+  //   The check below is gated on `limits->max_size_entity_group` being non-zero.  When
+  //   an embedder disables the entity-group limit (default = 64), the only protection
+  //   left is `nEntities > range.get_remaining_bytes() / 4` above.  For a max-size
+  //   grpl-child box that protection allows nEntities up to ~MAX_BOX_SIZE/4 ≈ 500M
+  //   entries, driving entity_ids.resize(500M) → ~2 GB allocation.  Reachable via
+  //   heif_context_get_entity_groups (the API allocator further multiplies per group).
+  //   Mitigation: gate against limits->max_memory_block_size or make
+  //   max_size_entity_group always-on with a sane non-zero default.
   if (limits->max_size_entity_group && nEntities > limits->max_size_entity_group) {
     std::stringstream sstr;
     sstr << "entity group box contains " << nEntities << " entities, but the security limit is set to " << limits->max_size_entity_group << " entities.";

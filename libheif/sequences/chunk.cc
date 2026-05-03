@@ -79,6 +79,16 @@ Chunk::Chunk(HeifContext* ctx, uint32_t track_id,
   m_track_id = track_id;
 
   m_first_sample = first_sample;
+  // AUDIT [HIGH — uint32 underflow]: when num_samples == 0, m_last_sample wraps to UINT32_MAX.
+  //   parse_stsc rejects samples_per_chunk==0, but Track::load (track.cc:380) uses an
+  //   overflow-prone uint32_t comparison `current_sample_idx + samples_per_chunk > stsz->num_samples()`
+  //   that wraps; a malicious stsc whose accumulated count overflows can drive a Chunk
+  //   construction with first_sample near UINT32_MAX and any non-zero num_samples → the
+  //   `first_sample + i` indexing into stsz->get_sample_sizes() at line 94 then performs an
+  //   OOB std::vector read in release builds (the assert is compiled out).  The returned
+  //   uint32_t becomes range.size and is later passed unchecked to
+  //   HeifFile::append_data_from_file_range (file.cc:836 — see AUDIT there) for an
+  //   attacker-controlled allocation and disk read.
   m_last_sample = first_sample + num_samples - 1;
 
   m_next_sample_to_be_decoded = first_sample;
@@ -90,12 +100,18 @@ Chunk::Chunk(HeifContext* ctx, uint32_t track_id,
       range.size = stsz->get_fixed_sample_size();
     }
     else {
+      // AUDIT [OOB-read — assert is debug-only]: in release builds, a successful upstream
+      // overflow check bypass (track.cc:380) lets first_sample + i exceed stsz->num_samples();
+      // get_sample_sizes()[first_sample + i] then OOB-reads the std::vector backing store.
       assert(first_sample + i < stsz->num_samples());
       range.size = stsz->get_sample_sizes()[first_sample + i];
     }
 
     m_sample_ranges.push_back(range);
 
+    // AUDIT [unbounded file_offset accumulation]: file_offset is uint64_t but is incremented
+    // by attacker-controlled per-sample sizes from stsz with no bounds check vs file size.
+    // The accumulated value is later used as a seek target in append_data_from_file_range.
     file_offset += range.size;
   }
 }

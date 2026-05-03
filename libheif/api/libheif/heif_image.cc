@@ -95,6 +95,14 @@ heif_error heif_image_crop(heif_image* img,
     };
   }
 
+  // AUDIT [missing argument bounds → underflow → giant alloc → OOB-write]:
+  //   left, right, top, bottom are signed `int` and are NOT validated against w,h.  They are
+  //   passed to HeifPixelImage::crop() which accepts uint32_t, so a negative `int` becomes
+  //   a huge uint32_t.  In crop() the line `right - left + 1` (pixelimage.cc:1659) computes
+  //   the new image width as a uint32_t; if right < left it underflows to ~UINT32_MAX.
+  //   That width is then plumbed into ImageComponent::alloc() with limits=nullptr (next line),
+  //   triggering the same overflow path documented in pixelimage.cc::ImageComponent::alloc.
+  //   Mitigation: clamp `0 <= left <= right < w` and `0 <= top <= bottom < h` here.
   auto cropResult = img->image->crop(left, static_cast<int>(w) - 1 - right, top, static_cast<int>(h) - 1 - bottom, nullptr);
   if (!cropResult) {
     return cropResult.error_struct(img->image.get());
@@ -236,6 +244,14 @@ heif_error heif_image_scale_image(const heif_image* input,
 {
   std::shared_ptr<HeifPixelImage> out_img;
 
+  // AUDIT [signed→unsigned reinterpretation + nullptr limits]:
+  //   width, height are signed `int`; scale_nearest_neighbor takes uint32_t, so a negative
+  //   value (e.g. -1) becomes 0xFFFFFFFF.  Combined with limits=nullptr passed below, this
+  //   bypasses pixel-count validation in the downstream alloc() path (see AUDIT comments in
+  //   pixelimage.cc:add_plane and ImageComponent::alloc).  In addition, scale_nearest_neighbor
+  //   itself contains an y*m_height / x*m_width uint32_t-multiplication overflow leading to
+  //   OOB reads of the source plane (see AUDIT comments at scale_nearest_neighbor body).
+  //   Mitigation: validate width>0 && height>0 here, and forward a heif_security_limits.
   Error err = input->image->scale_nearest_neighbor(out_img, width, height, nullptr);
   if (err) {
     return err.error_struct(input->image.get());
@@ -251,6 +267,10 @@ heif_error heif_image_scale_image(const heif_image* input,
 heif_error heif_image_extend_to_size_fill_with_zero(heif_image* image,
                                                     uint32_t width, uint32_t height)
 {
+  // AUDIT [nullptr limits — same alloc-overflow exposure]: width/height are uint32_t, so no
+  // sign-reinterpretation, but the limits=nullptr passes through to the same
+  // ImageComponent::alloc() path, so any width*height that does not individually equal UINT32_MAX
+  // can drive the alloc-overflow described in pixelimage.cc::ImageComponent::alloc.
   Error err = image->image->extend_to_size_with_zero(width, height, nullptr);
   if (err) {
     return err.error_struct(image->image.get());
@@ -271,6 +291,12 @@ int heif_image_get_decoding_warnings(heif_image* image,
   else {
     const auto& warnings = image->image->get_warnings();
     int n;
+    // AUDIT [signed-overflow / OOB-read]: `n + first_warning_idx` is `int + int`.
+    //   - If first_warning_idx is negative, the loop reads warnings[n + first_warning_idx]
+    //     with a negative index → OOB read on the std::vector (operator[] is unchecked).
+    //   - If first_warning_idx is large positive, `n + first_warning_idx` may overflow signed
+    //     int during the loop comparison (UB) and either terminate early or run past end.
+    //   Mitigation: clamp first_warning_idx to [0, warnings.size()] and use size_t arithmetic.
     for (n = 0; n + first_warning_idx < (int) warnings.size() && n < max_output_buffer_entries; n++) {
       out_warnings[n] = warnings[n + first_warning_idx].error_struct(image->image.get());
     }
@@ -357,6 +383,12 @@ heif_error heif_image_add_plane(heif_image* image,
                                 heif_channel channel, int width, int height, int bit_depth)
 {
   // Note: no security limit, because this is explicitly requested by the user.
+  // AUDIT [signed→unsigned reinterpretation, OOB-write enabler]: width and height are signed
+  // `int`.  HeifPixelImage::add_plane takes them as uint32_t, so a negative value (e.g. -2)
+  // becomes 0xFFFFFFFE.  Combined with the missing pixel-count limit on this nullptr-limits
+  // path, the alloc() multiplication can overflow and yield an undersized buffer (see AUDIT
+  // comments in pixelimage.cc::ImageComponent::alloc).  Mitigation: reject width<=0 || height<=0
+  // here, or steer applications to heif_image_add_plane_safe with a non-null limits.
   if (auto err = image->image->add_plane(channel, width, height, bit_depth, nullptr)) {
     return err.error_struct(image->image.get());
   }
@@ -402,6 +434,10 @@ int heif_image_is_premultiplied_alpha(heif_image* image)
 
 heif_error heif_image_extend_padding_to_size(heif_image* image, int min_physical_width, int min_physical_height)
 {
+  // AUDIT [signed→unsigned reinterpretation + nullptr limits]:
+  //   Same pattern as heif_image_scale_image / heif_image_add_plane: signed `int` arguments
+  //   are widened to uint32_t inside HeifPixelImage::extend_padding_to_size, and limits=nullptr
+  //   leaves the alloc-overflow path unprotected.  Reachable from the public API.
   Error err = image->image->extend_padding_to_size(min_physical_width, min_physical_height, false, nullptr);
   if (err) {
     return err.error_struct(image->image.get());

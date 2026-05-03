@@ -640,6 +640,16 @@ Error HeifPixelImage::ImageComponent::alloc(uint32_t width, uint32_t height, hei
 
   int bytes_per_pixel = get_bytes_per_pixel();
 
+  // AUDIT [integer-overflow → heap-OOB, reachable from heif_image_add_plane]:
+  //   stride_64 = m_mem_width * bytes_per_pixel.  m_mem_width is uint32_t (≤ ~2^32 after the
+  //   width!=UINT32_MAX guard above).  bytes_per_pixel is the return of get_bytes_per_pixel(),
+  //   which can reach (bit_depth/8)*num_interleaved_components ≈ 16 * 255 = 4080 — well within
+  //   uint64_t range, so this multiplication itself is safe.  However the alignment round-up
+  //   `(stride_64 + alignment - 1) & ~(alignment-1)` does NOT overflow-check: if
+  //   stride_64 > UINT64_MAX - 15, the addition wraps to 0..14 and the mask leaves stride = 0.
+  //   That cannot occur for the width range above (2^32 * 4080 ≈ 2^44 << UINT64_MAX), so the
+  //   stride computation is safe in practice; but it is not formally proved if get_bytes_per_pixel
+  //   ever returns a larger value in the future.
   uint64_t stride_64 = static_cast<uint64_t>(m_mem_width) * bytes_per_pixel;
   stride_64 = (stride_64 + alignment - 1U) & ~static_cast<uint64_t>(alignment - 1U);
   if (stride_64 > std::numeric_limits<size_t>::max()) {
@@ -651,6 +661,13 @@ Error HeifPixelImage::ImageComponent::alloc(uint32_t width, uint32_t height, hei
 
   assert(alignment>=1);
 
+  // AUDIT [missing pixel-count limit on public API path]: this `if (limits && ...)` only
+  // triggers when the caller passes a non-null limits pointer.  heif_image_add_plane()
+  // (the non-_safe variant) explicitly passes nullptr — see heif_image.cc:360.  Therefore
+  // a public-API caller can request any width × height combination that does not individually
+  // hit UINT32_MAX, including pathological pairs like 0xFFFFFFFE × 0xFFFFFFFE.  In that case
+  // the alloc_64 multiplication below produces a uint64_t ≈ 2^64 which DOES wrap (see next
+  // AUDIT note).  Apps should be encouraged to call heif_image_add_plane_safe.
   if (limits &&
       limits->max_image_size_pixels &&
       limits->max_image_size_pixels / height < width) {
@@ -667,6 +684,15 @@ Error HeifPixelImage::ImageComponent::alloc(uint32_t width, uint32_t height, hei
   // Check for allocation size overflow using 64-bit arithmetic
   // Test case was an overlay image with size 1x134217727.
   // Width 1 gets aligned to 64 and then width * height overflows 32 bit systems.
+  // AUDIT [integer-overflow → undersized buffer → OOB-write, reachable from heif_image_add_plane]:
+  //   `m_mem_height * stride` is computed in uint64_t.  With width = height = 0xFFFFFFFE
+  //   (the C public API takes signed `int width, int height`; a negative value reinterpreted
+  //   as uint32_t reaches this point through HeifPixelImage::add_plane), m_mem_height ≈ 2^32
+  //   and stride ≈ 2^44, so the product is ≈ 2^76 and wraps modulo 2^64 to a SMALL value.
+  //   The check `alloc_64 > size_t::max` then passes (because the wrapped value is small),
+  //   `new uint8_t[allocation_size]` succeeds, and any subsequent write through a row pointer
+  //   (e.g. heif_image_get_plane → caller writes height*stride bytes) is heap-OOB.
+  //   Fix: detect overflow before the multiplication, e.g. `if (m_mem_height && stride > UINT64_MAX / m_mem_height) ...`
   uint64_t alloc_64 = static_cast<uint64_t>(m_mem_height) * stride + alignment - 1;
   if (alloc_64 > std::numeric_limits<size_t>::max()) {
     return {heif_error_Memory_allocation_error,
@@ -1629,6 +1655,15 @@ Result<std::shared_ptr<HeifPixelImage>> HeifPixelImage::crop(uint32_t left, uint
 
 
 
+  // AUDIT [underflow when right < left or bottom < top, OOB enabler]:
+  //   `right - left + 1` and `bottom - top + 1` are uint32_t subtractions.  Both crop()
+  //   public callers (heif_image_crop and the internal cropping in apply_image_transformations)
+  //   compute `right` and `bottom` as `dim - 1 - margin`, where `margin` and the original
+  //   inputs are not always bounds-checked (see AUDIT note in heif_image_crop).  When right<left,
+  //   the difference wraps to ~UINT32_MAX.  The wrapped width/height is stored in m_width/m_height
+  //   on the new image and used as the basis for plane allocation below, allowing an attacker-
+  //   controlled crop call to drive a giant allocation request and (combined with the alloc
+  //   overflow analysis) an undersized buffer.
   auto out_img = std::make_shared<HeifPixelImage>();
   out_img->create(right - left + 1, bottom - top + 1, m_colorspace, m_chroma);
 
@@ -1643,6 +1678,10 @@ Result<std::shared_ptr<HeifPixelImage>> HeifPixelImage::crop(uint32_t left, uint
     uint32_t plane_top = get_subsampled_size_v(top, channel, m_chroma, scaling_mode::is_divisible);
     uint32_t plane_bottom = get_subsampled_size_v(bottom, channel, m_chroma, scaling_mode::round_down);
 
+    // AUDIT [underflow propagating to alloc]: if plane_right < plane_left (caused by
+    // chroma-subsampling rounding mismatch when left/right straddle a chroma sample boundary,
+    // or by the wrapped values from the parent if right<left), the (uint32_t) subtraction
+    // wraps to ~UINT32_MAX and becomes the requested allocation width.
     auto err = out_img->add_channel(channel,
                                     plane_right - plane_left + 1,
                                     plane_bottom - plane_top + 1,
@@ -1996,6 +2035,16 @@ Error HeifPixelImage::scale_nearest_neighbor(std::shared_ptr<HeifPixelImage>& ou
       size_t out_stride = 0;
       auto* out_data = out_img->get_plane(heif_channel_interleaved, &out_stride);
 
+      // AUDIT [integer-overflow → OOB-read, reachable from heif_image_scale_image]:
+      //   `iy = y * m_height / height` performs uint32_t multiplication BEFORE the divide.
+      //   With y < out_h (= caller-supplied `height`) and m_height up to ~2^31 (loaded from
+      //   ispe box / decoded source), the product `y * m_height` can exceed 2^32 and wrap.
+      //   The wrapped numerator divided by `height` then yields an `iy` value > m_height,
+      //   so `in_data[iy * in_stride + ...]` is an OOB read past the source plane.
+      //   Same pattern applies to `ix = x * m_width / width` below.
+      //   Mitigation: widen to uint64_t before the multiply:
+      //     uint32_t iy = (uint32_t)((uint64_t)y * m_height / height);
+      //   The HDR variant 20 lines below has the identical bug.
       for (uint32_t y = 0; y < out_h; y++) {
         uint32_t iy = y * m_height / height;
 
@@ -2020,6 +2069,8 @@ Error HeifPixelImage::scale_nearest_neighbor(std::shared_ptr<HeifPixelImage>& ou
 
       in_stride /= 2;
 
+      // AUDIT [integer-overflow → OOB-read]: same y*m_height and x*m_width overflow as the
+      // SDR branch above.  Reachable via heif_image_scale_image with an HDR (>8-bit) input.
       for (uint32_t y = 0; y < out_h; y++) {
         uint32_t iy = y * m_height / height;
 
@@ -2055,6 +2106,9 @@ Error HeifPixelImage::scale_nearest_neighbor(std::shared_ptr<HeifPixelImage>& ou
         size_t out_stride = 0;
         auto* out_data = out_img->get_plane(channel, &out_stride);
 
+        // AUDIT [integer-overflow → OOB-read]: same y*m_height / x*m_width overflow as the
+        // interleaved variant above; the SDR planar path is reachable for the typical
+        // YCbCr / RGB planar source.
         for (uint32_t y = 0; y < out_h; y++) {
           uint32_t iy = y * m_height / height;
 
@@ -2076,6 +2130,8 @@ Error HeifPixelImage::scale_nearest_neighbor(std::shared_ptr<HeifPixelImage>& ou
 
         in_stride /= 2;
 
+        // AUDIT [integer-overflow → OOB-read]: same y*m_height / x*m_width overflow as the
+        // SDR variants; HDR planar path.
         for (uint32_t y = 0; y < out_h; y++) {
           uint32_t iy = y * m_height / height;
 
@@ -2191,6 +2247,18 @@ Result<std::shared_ptr<HeifPixelImage>>
 HeifPixelImage::extract_image_area(uint32_t x0, uint32_t y0, uint32_t w, uint32_t h,
                                    const heif_security_limits* limits) const
 {
+  // AUDIT [underflow → OOB-read in subsequent memcpy, reachable from heif_image_extract_area]:
+  //   `get_width() - x0` underflows to ~UINT32_MAX when x0 > image width.  std::min with the
+  //   caller-supplied `w` then yields min(w, huge) = w (attacker-chosen), bypassing the bounds
+  //   intent of this clamp.  The same applies to `get_height() - y0`.  Downstream:
+  //     - create_clone_image_at_new_size allocates an image of size (minW, minH); for small
+  //       w,h the allocation is small but the per-channel loop may still execute many iterations.
+  //     - the per-channel loop computes `src_data + xs + (ys + py) * src_stride` where the
+  //       channel-scaled `ys` can reach a huge value (since y0 was unbounded), leading to
+  //       OOB read in the memcpy at ~line 2261 if the underflow propagates through
+  //       channel_height(y0,...).  Note: minH = w only protects copy_height through
+  //       clamping with src_plane_h, but src_plane_h - ys also underflows when ys > src_plane_h.
+  //   Mitigation: validate `x0 <= get_width() && y0 <= get_height()` before subtracting.
   uint32_t minW = std::min(w, get_width() - x0);
   uint32_t minH = std::min(h, get_height() - y0);
 
@@ -2224,12 +2292,31 @@ HeifPixelImage::extract_image_area(uint32_t x0, uint32_t y0, uint32_t w, uint32_
     // Clamp copy size to source plane bounds to avoid chroma rounding mismatch OOB read.
     uint32_t src_plane_h = channel_height(get_height(), chroma, channel);
     uint32_t src_plane_w = channel_width(get_width(), chroma, channel);
+    // AUDIT [underflow defeats this clamp]:
+    //   `src_plane_w - xs` and `src_plane_h - ys` are uint32_t subtractions.  If x0 > get_width()
+    //   propagated through (see AUDIT note at function entry), xs > src_plane_w, the subtraction
+    //   wraps to ~UINT32_MAX, and std::min returns the attacker-supplied minW unchanged — so this
+    //   clamp does NOT prevent OOB reads in that case.  Same for the height path.
     uint32_t copy_width = std::min(channel_width(minW, chroma, channel), src_plane_w - xs);
     uint32_t copy_height = std::min(channel_height(minH, chroma, channel), src_plane_h - ys);
 
+    // AUDIT [signed → unsigned and integer-narrowing]:
+    //   `get_storage_bits_per_pixel(channel) / 8` returns 0 if storage bits < 8 (e.g. a 4-bit
+    //   sub-byte format).  copy_width then becomes 0 — silently produces no copy, masking
+    //   real errors.  More importantly, `copy_width *= ...` and `xs *= ...` use uint32_t
+    //   without overflow check; with copy_width up to ~2^32 (after the clamp underflow above)
+    //   and bytes-per-pixel up to 16, `copy_width * 16` overflows to a value much smaller
+    //   than expected, causing the memcpy to copy a wrong (and possibly attacker-chosen)
+    //   number of bytes.
     copy_width *= get_storage_bits_per_pixel(channel) / 8;
     xs *= get_storage_bits_per_pixel(channel) / 8;
 
+    // AUDIT [OOB-read in memcpy when xs/ys are corrupted]:
+    //   Address arithmetic: `src_data + xs + (ys + py) * src_stride`.
+    //   `(ys + py) * src_stride` is computed in uint32_t (size_t on 64-bit it actually widens —
+    //   but ys+py first overflows in uint32_t!).  With ys near UINT32_MAX and src_stride > 1,
+    //   the multiplication wraps and the resulting pointer can land far outside the source
+    //   plane buffer.  Result: arbitrary out-of-bounds read into `out_data`.
     for (uint32_t py = 0; py < copy_height; py++) {
       memcpy(out_data + py * out_stride,
              src_data + xs + (ys + py) * src_stride,

@@ -1355,6 +1355,16 @@ Error HeifContext::get_id_of_non_virtual_child_image(heif_item_id id, heif_item_
 
     // TODO: check whether this really can be recursive (e.g. overlay of grid images)
 
+    // AUDIT [HIGH — unbounded recursion → stack overflow / SIGSEGV in public API]:
+    //   Cycle detection only rejects DIRECT self-reference (image_references[0] == id).
+    //   An A→B→A cycle through two derived items (grid→iden, iden→grid, iovl chains)
+    //   recurses indefinitely.  Note that 64b662f / e5b8331b added cyclic-reference
+    //   checks to the parser, but this recursion path is reached from public APIs
+    //   AFTER parsing (heif_image_handle_get_luma_bits_per_pixel,
+    //   heif_image_handle_get_chroma_bits_per_pixel, get_decoder for grid/iden/iovl)
+    //   and re-walks the iref graph without using a visited-set.  Mitigation: pass a
+    //   processed_ids set down through this function, mirroring the protection used
+    //   in image_item.cc::decode_compressed_image.
     if (image_references.empty() || image_references[0] == id) {
       return Error(heif_error_Invalid_input,
                    heif_suberror_No_item_data,
@@ -1757,6 +1767,18 @@ Result<std::shared_ptr<ImageItem>> HeifContext::encode_thumbnail(const std::shar
 
 Error HeifContext::add_exif_metadata(const std::shared_ptr<ImageItem>& master_image, const void* data, int size)
 {
+  // AUDIT [HIGH — signed→unsigned reinterpretation, OOB-read of caller buffer + signed overflow]:
+  //   `size` is signed `int`, unchecked.  Three problems flow from this:
+  //   1. Line `(unsigned int) size` casts a negative size to ~UINT_MAX, so the search
+  //      loop runs for billions of iterations across attacker memory until it hits
+  //      the magic bytes or segfaults.
+  //   2. `data_array.resize(size + 4)` is signed addition; signed-int overflow when
+  //      size == INT_MAX is UB.
+  //   3. `memcpy(..., data, size)` promotes size to size_t — a negative size becomes
+  //      ~SIZE_MAX → OOB read of the caller's `data` buffer.
+  //   Reachable from heif_context_add_exif_metadata.  Reject size < 0 here.
+  // AUDIT [missing NULL check]: `data` is dereferenced via memcmp without a NULL check.
+  //   Caller passing data = NULL with size > 0 segfaults inside memcmp.
   // find location of TIFF header
   uint32_t offset = 0;
   const char* tiffmagic1 = "MM\0*";
@@ -1799,6 +1821,14 @@ Error HeifContext::add_generic_metadata(const std::shared_ptr<ImageItem>& master
                                         uint32_t item_type, const char* content_type, const char* item_uri_type, heif_metadata_compression compression,
                                         heif_item_id* out_item_id)
 {
+  // AUDIT [HIGH — signed→unsigned reinterpretation, OOB-read of caller buffer]:
+  //   `size` is signed int.  In the `compression == zlib/deflate` branches below it is
+  //   passed to compress_zlib((const uint8_t*)data, size) which takes size_t — a
+  //   negative size becomes ~SIZE_MAX and zlib reads attacker-process memory.  In the
+  //   uncompressed branch, `data_array.resize(size)` (line ~1861) and `memcpy(..., data,
+  //   size)` (line ~1862) similarly OOB-read.  Reject size < 0 at function entry.
+  //   Reachable from heif_context_add_generic_metadata, heif_context_add_XMP_metadata,
+  //   heif_context_add_generic_uri_metadata, and indirectly from add_exif_metadata.
   // create an infe box describing what kind of data we are storing (this also creates a new ID)
 
   auto infe_result = m_heif_file->add_new_infe_box(item_type);

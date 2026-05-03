@@ -66,6 +66,11 @@ int heif_image_handle_get_list_of_text_item_ids(const heif_image_handle* handle,
                                                   int max_count)
 {
   auto text_item_ids = handle->image->get_text_item_ids();
+  // AUDIT [HIGH — signed/unsigned → wild OOB-write]: identical to the bug in
+  //   heif_regions.cc::heif_image_handle_get_list_of_region_item_ids.  max_count is
+  //   signed int; if negative, `num` is negative; `num * sizeof(heif_item_id)` casts
+  //   to a giant size_t for memcpy → wild OOB write into caller buffer.
+  //   Mitigation: `if (max_count < 0) return 0;` before std::min.
   int num = std::min((int) text_item_ids.size(), max_count);
 
   memcpy(item_ids, text_item_ids.data(), num * sizeof(heif_item_id));

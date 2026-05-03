@@ -69,15 +69,34 @@ Error unc_decoder::fetch_tile_data(const DataExtent& dataExtent,
   }
 
   auto sizes = get_tile_data_sizes();
+  // AUDIT [HIGH — uint32 multiplication overflow]:
+  //   `tile_y * (m_width / m_tile_width)` is uint32_t multiplication.  m_width / m_tile_width
+  //   gives the column count; with tile_y near 0xFFFF and column count near 0xFFFF, the
+  //   product wraps.  The wrapped tileIdx is then trusted as an absolute tile number for
+  //   - file-offset computation `sizes[0] * tileIdx` (line 76, uint64_t multiplication —
+  //     also can wrap for huge sizes/tileIdx),
+  //   - vector subscript at line 128 (`tile_idx >= units.size()` — wrapped value can be
+  //     small, falsely passing the bounds check),
+  //   - and per-component offset computation at line 85.
+  //   Promote to uint64_t and check overflow.
   uint32_t tileIdx = tile_x + tile_y * (m_width / m_tile_width);
 
   if (sizes.size() == 1) {
     // Single contiguous read (component, pixel, mixed, row interleave)
+    // AUDIT [uint64 overflow — sizes[0] * tileIdx]: with very large sizes[0] (achievable
+    // with extreme tile dims and 64-bit components) and tileIdx wrapped from above, the
+    // product wraps uint64_t.  read_data is then called with a tiny offset that points
+    // inside another tile or another item entirely.
     uint64_t tile_start_offset = sizes[0] * tileIdx;
     return get_compressed_image_data_uncompressed(dataExtent, properties, &tile_data, tile_start_offset, sizes[0], tileIdx, nullptr);
   }
   else {
     // Scattered per-component reads (tile_component interleave)
+    // AUDIT [uint32 num_tiles overflow]: (m_width / m_tile_width) * (m_height / m_tile_height)
+    // is uint32_t.  For grids of > 2^32 tiles the product wraps; component_offset += size*num_tiles
+    // (line 94) then uses the wrapped value, mis-aligning every subsequent component.  Combined
+    // with the wrapped tileIdx above, multi-component scattered reads produce data drawn from
+    // wrong file regions.
     uint32_t num_tiles = (m_width / m_tile_width) * (m_height / m_tile_height);
     uint64_t component_offset = 0;
 
