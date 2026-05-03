@@ -102,7 +102,15 @@ Error FileLayout::read(const std::shared_ptr<StreamReader>& stream, const heif_s
   bool moov_found = false;
 
   for (;;) {
-    // TODO: overflow
+    // Saturation guard: through normal traversal next_box_start is bounded by
+    // m_max_length (advanced only by get_box_size() which is itself bounded), but
+    // a defence-in-depth check makes the +MAXIMUM_BOX_HEADER_SIZE addition formally
+    // safe in case the upstream invariants ever change (e.g. a 64-bit length API).
+    if (next_box_start > std::numeric_limits<uint64_t>::max() - MAXIMUM_BOX_HEADER_SIZE) {
+      return {heif_error_Invalid_input,
+              heif_suberror_Unspecified,
+              "Box position too large, integer overflow"};
+    }
     uint64_t next_box_header_end = next_box_start + MAXIMUM_BOX_HEADER_SIZE;
     if (next_box_header_end > m_max_length) {
       m_max_length = stream->request_range(next_box_start, next_box_header_end);
