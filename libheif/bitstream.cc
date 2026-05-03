@@ -23,6 +23,7 @@
 #include <utility>
 #include <cstring>
 #include <cassert>
+#include <limits>
 
 #include "common_utils.h"
 
@@ -108,6 +109,9 @@ StreamReader::grow_status StreamReader_memory::wait_for_file_size(uint64_t targe
 
 bool StreamReader_memory::read(void* data, size_t size)
 {
+  if (size > std::numeric_limits<uint64_t>::max() - m_position) {
+    return false;
+  }
   uint64_t end_pos = m_position + size;
   if (end_pos > m_length) {
     return false;
