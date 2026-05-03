@@ -20,6 +20,7 @@
 
 #include "codecs/decoder.h"
 
+#include <limits>
 #include <utility>
 #include "error.h"
 #include "context.h"
@@ -93,6 +94,15 @@ Result<std::vector<uint8_t>> DataExtent::read_data(uint64_t offset, uint64_t siz
   std::vector<uint8_t> data;
 
   if (!m_raw.empty()) {
+    // Bound the iterator arithmetic: when m_raw is pre-populated (caching path)
+    // and offset + size > m_raw.size(), the iterators would advance past
+    // m_raw.end() — UB and an OOB read. Guard against the addition wrapping too.
+    if (size > std::numeric_limits<uint64_t>::max() - offset ||
+        offset + size > m_raw.size()) {
+      return Error{heif_error_Invalid_input,
+                   heif_suberror_End_of_data,
+                   "Read past end of cached DataExtent buffer"};
+    }
     data.insert(data.begin(), m_raw.begin() + offset, m_raw.begin() + offset + size);
     return data;
   }
