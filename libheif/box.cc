@@ -1912,12 +1912,17 @@ Error Box_iloc::read_data(heif_item_id item_id,
                 "idat box referenced in iref box is not present in file"};
       }
 
+      // Clamp to the caller's requested 'size' so a single extent cannot over-read
+      // past the requested cap (mirrors the std::min in the construction_method == 0
+      // branch above) and so the unsigned subtraction below cannot wrap to ~0ULL when
+      // extent.length > size.
+      uint64_t idat_read_len = std::min(extent.length, size);
       idat->read_data(istr,
                       extent.offset + item->base_offset,
-                      extent.length,
+                      idat_read_len,
                       *dest, limits);
 
-      size -= extent.length;
+      size -= idat_read_len;
     }
     else {
       std::stringstream sstr;
