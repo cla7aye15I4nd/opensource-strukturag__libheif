@@ -4075,10 +4075,17 @@ Error Box_idat::read_data(const std::shared_ptr<StreamReader>& istr,
                  heif_suberror_End_of_data);
   }
 
-  bool success;
-  success = istr->seek(m_data_start_pos + (std::streampos) start);
-  assert(success);
-  (void) success;
+  // The original code only caught seek/read failures via assert(), which is
+  // compiled out under NDEBUG. If a bounds check above is ever bypassed (e.g. by
+  // a regression in the overflow handling) seek() would silently return false and
+  // the subsequent read() would populate out_data from the wrong file position.
+  // Return a hard error instead.
+  bool success = istr->seek(m_data_start_pos + (std::streampos) start);
+  if (!success) {
+    return Error(heif_error_Invalid_input,
+                 heif_suberror_End_of_data,
+                 "Could not seek to idat data start");
+  }
 
   if (length > 0) {
     // reserve space for the data in the output array
@@ -4086,8 +4093,11 @@ Error Box_idat::read_data(const std::shared_ptr<StreamReader>& istr,
     uint8_t* data = &out_data[curr_size];
 
     success = istr->read((char*) data, static_cast<size_t>(length));
-    assert(success);
-    (void) success;
+    if (!success) {
+      return Error(heif_error_Invalid_input,
+                   heif_suberror_End_of_data,
+                   "Could not read idat data");
+    }
   }
 
   return Error::Ok;
