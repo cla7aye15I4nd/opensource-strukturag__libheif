@@ -206,7 +206,15 @@ Error FileLayout::read(const std::shared_ptr<StreamReader>& stream, const heif_s
                 "Cannot read moov box with unspecified size"};
       }
 
-      // TODO: overflow
+      // Reject a wrapping moov box length before constructing BitstreamRange — same
+      // primitive as the meta-box case above. Without this guard the BitstreamRange
+      // ctor (under NDEBUG) underflows m_remaining to ~SIZE_MAX and disables bounds
+      // checks for the moov-box parse.
+      if (box_header.get_box_size() > std::numeric_limits<uint64_t>::max() - moov_box_start) {
+        return {heif_error_Invalid_input,
+                heif_suberror_No_moov_box,
+                "moov box size too large, integer overflow"};
+      }
       uint64_t end_of_moov_box = moov_box_start + box_header.get_box_size();
       if (m_max_length < end_of_moov_box) {
         m_max_length = m_stream_reader->request_range(moov_box_start, end_of_moov_box);
