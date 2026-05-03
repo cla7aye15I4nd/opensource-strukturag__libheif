@@ -135,7 +135,16 @@ Error FileLayout::read(const std::shared_ptr<StreamReader>& stream, const heif_s
                 "Cannot read meta box with unspecified size"};
       }
 
-      // TODO: overflow
+      // Reject a wrapping meta box length before constructing BitstreamRange. Without
+      // this check, a crafted largesize would produce end_of_meta_box < meta_box_start;
+      // the BitstreamRange constructor's assert(end >= start) is compiled out under
+      // NDEBUG and m_remaining would underflow to ~SIZE_MAX, disabling all subsequent
+      // bounds checks for the meta-box parse.
+      if (box_header.get_box_size() > std::numeric_limits<uint64_t>::max() - meta_box_start) {
+        return {heif_error_Invalid_input,
+                heif_suberror_No_meta_box,
+                "meta box size too large, integer overflow"};
+      }
       uint64_t end_of_meta_box = meta_box_start + box_header.get_box_size();
       if (m_max_length < end_of_meta_box) {
         m_max_length = m_stream_reader->request_range(meta_box_start, end_of_meta_box);
