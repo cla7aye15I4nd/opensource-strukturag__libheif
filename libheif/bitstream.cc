@@ -165,13 +165,20 @@ BitstreamRange::BitstreamRange(std::shared_ptr<StreamReader> istr,
 BitstreamRange::BitstreamRange(std::shared_ptr<StreamReader> istr,
                                size_t start,
                                size_t end) // one past end
-  : m_istr(std::move(istr)), m_remaining(end - start)
+  : m_istr(std::move(istr)), m_remaining(end >= start ? end - start : 0)
 {
-  assert(end >= start);
+  // Hard runtime check: under NDEBUG the original assert(end >= start) is
+  // compiled out, and `end - start` wraps to ~SIZE_MAX. m_remaining = ~SIZE_MAX
+  // makes every prepare_read() trivially succeed and disables bounds checking.
+  // Treat the bad range as an immediate error so reads return 0 safely.
+  if (end < start) {
+    m_error = true;
+    return;
+  }
 
-  bool success = m_istr->seek(start);
-  assert(success);
-  (void)success; // TODO
+  if (!m_istr->seek(start)) {
+    m_error = true;
+  }
 }
 
 
